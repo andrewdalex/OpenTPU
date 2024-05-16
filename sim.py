@@ -58,7 +58,7 @@ class TPUSim(object):
         # all done, exit
         savepath = 'sim32.npy' if args.raw else 'sim8.npy'
         np.save(savepath, self.host_memory)
-        print(self.host_memory.astype('uint8'))
+        print(self.host_memory.astype('int8'))
         self.program.close()
 
         print("""ALL DONE!
@@ -72,8 +72,11 @@ class TPUSim(object):
         operand_list = []
         current_opcode = ""
 
-        while (current_opcode != "HLT"):
-            current_opcode = int.from_bytes(self.program.read(isa.OP_SIZE), byteorder='big')
+        while True:
+            bytes = self.program.read(isa.OP_SIZE)
+            if not bytes:
+                break
+            current_opcode = int.from_bytes(bytes, byteorder='big')
             current_opcode = isa.BIN2OPCODE[current_opcode]
             opcode_list.append(current_opcode)
             current_flag = int.from_bytes(self.program.read(isa.FLAGS_SIZE), byteorder='big')
@@ -106,16 +109,36 @@ class TPUSim(object):
         # downsample/normalize if needed
         if not args.raw:
             result = [v & 0x000000FF for v in result]
-        self.unified_buffer[dest:dest+length] = result
 
-        # branch if equal weight matrix holds e and p. if result[0][0] == 0 and e == 1, pc += p. else pc += 1
-        print(f"branch_eq_vect: enabled = {result[0][-3]}, branch pc diff = {result[0][-2]}")
-        if (0 > result[0][-3] > 1):
-            raise ValueError(f"Branch boolean must be 0 or 1. Instead it's {result[0][-3]}.)")
-        if (result[0][-3] == 1 and result[0][0] == 0):
-            self.pc += result[0][-2].astype(np.int8)
+        # branching/comparison logic
+        if result[0][-1] == 1:
+            if result[0][-2] == 1:
+                self.pc += 1 + result[0][0].astype(np.int8)
+            else:
+                self.pc += 1 + result[0][1].astype(np.int8)
+            return # don't to the UB write when there's a branch
+        # equality check
+        elif result[0][-1] == 2:
+            result[0][-1] == 0
+            if result[0][0] == result[0][1]:
+                result[0][0] = 1
+            else:
+                result[0][0] = 0
+            result[0][1] = 0
+            self.pc += 1
+        elif result[0][-1] == 3:
+            # breakpoint()
+            result[0][-1] == 0
+            if result[0][0] < result[0][1]:
+                result[0][0] = 1
+            else:
+                result[0][0] = 0
+            result[0][1] = 0
+            self.pc += 1 
         else:
             self.pc += 1
+        self.unified_buffer[dest:dest+length] = result
+
 
     def memops(self, opcode, src_addr, dest_addr, length, flag):
         print('Memory xfer! host: {} unified buffer: {}: length: {} (FLAGS? {})'.format(
