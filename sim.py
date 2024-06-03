@@ -20,10 +20,11 @@ class TPUSim(object):
         self.weight_memory = np.load(dram_filename)
         self.host_memory = np.load(hostmem_filename)
         if not args.raw:
-            assert self.weight_memory.dtype == np.int8, 'DRAM weight mem is not 8-bit ints'
-            assert self.host_memory.dtype == np.int8, 'Hostmem not 8-bit ints'
+            pass
+            # assert self.weight_memory.dtype == np.int8, 'DRAM weight mem is not 8-bit ints'
+            # assert self.host_memory.dtype == np.int8, 'Hostmem not 8-bit ints'
         self.unified_buffer = (np.zeros((96000, WIDTH), dtype=np.float32) if args.raw else
-            np.zeros((96000, WIDTH), dtype=np.int8))
+            np.zeros((96000, WIDTH), dtype=np.int32))
         self.accumulator = (np.zeros((4000, WIDTH), dtype=np.float32) if args.raw else
             np.zeros((4000, WIDTH), dtype=np.int32))
         self.weight_fifo = deque()
@@ -107,15 +108,16 @@ class TPUSim(object):
         print(f'after = {result}')
 
         # downsample/normalize if needed
-        if not args.raw:
-            result = [v & 0x000000FF for v in result]
+        # Don't downsample for gpmatmul
+        # if not args.raw:
+        #     result = [v & 0x000000FF for v in result]
 
         # branching/comparison logic
         if result[0][-1] == 1:
             if result[0][-2] == 1:
-                self.pc += 1 + result[0][0].astype(np.int8)
+                self.pc += 1 + result[0][0].astype(np.int32)
             else:
-                self.pc += 1 + result[0][1].astype(np.int8)
+                self.pc += 1 + result[0][1].astype(np.int32)
             return # don't to the UB write when there's a branch
         # equality check
         elif result[0][-1] == 2:
@@ -134,7 +136,10 @@ class TPUSim(object):
             else:
                 result[0][0] = 0
             result[0][1] = 0
-            self.pc += 1 
+            self.pc += 1
+        elif result[0][-1] == 4:
+            self.pc = result[0][1]
+            return
         else:
             self.pc += 1
         self.unified_buffer[dest:dest+length] = result
@@ -147,10 +152,30 @@ class TPUSim(object):
 
         if opcode == 'RHM':
             print('  read host memory to unified buffer')
-            self.unified_buffer[dest_addr:dest_addr + length] = self.host_memory[src_addr:src_addr + length]
+            read_data = np.zeros((1, WIDTH))
+            if flag & isa.SWITCH_MASK:
+                addr = self.unified_buffer[-1][0]
+                vec_addr = addr // 8
+                column = addr % 8
+                read_data[0][0] = self.host_memory[vec_addr][column]
+                self.unified_buffer[dest_addr] = read_data
+            elif flag & isa.CONV_MASK:
+                breakpoint()
+                read_data[0][1] = self.pc + 2
+                read_data[0][-1] = 4
+                self.unified_buffer[dest_addr] = read_data
+            else:
+                self.unified_buffer[dest_addr:dest_addr + length] = self.host_memory[src_addr:src_addr + length]
         elif opcode == 'WHM':
             print('  write unified buffer to host memory')
-            self.host_memory[dest_addr:dest_addr + length] = self.unified_buffer[src_addr:src_addr + length]
+            # asm format dest, src, len
+            if flag & isa.SWITCH_MASK:
+                addr = self.unified_buffer[-1][0]
+                vec_addr = addr // 8
+                column = addr % 8
+                self.host_memory[vec_addr][column] = self.unified_buffer[src_addr][0]
+            else:
+                self.host_memory[dest_addr:dest_addr + length] = self.unified_buffer[src_addr:src_addr + length]
         elif opcode == 'RW':
             print('  read weights from DRAM into MMU')
             self.weight_fifo.append(self.weight_memory[src_addr])
@@ -160,13 +185,13 @@ class TPUSim(object):
         self.pc += 1
 
     def matrix_multiply_convolve(self, ub_addr, accum_addr, size, flags):
-        print('Matrix things....')
-        print('  UB@{} + {} -> MMU -> accumulator@{} + {}'.format(
-            ub_addr, size, accum_addr, size
-        ))
+        # print('Matrix things....')
+        # print('  UB@{} + {} -> MMU -> accumulator@{} + {}'.format(
+        #     ub_addr, size, accum_addr, size
+        # ))
 
         inp = self.unified_buffer[ub_addr: ub_addr + size]
-        print('MMC input shape: {}'.format(inp.shape))
+        # print('MMC input shape: {}'.format(inp.shape))
         weight_mat = self.weight_fifo.popleft()
         if not args.raw:
             inp = inp.astype(np.int32)
