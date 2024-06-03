@@ -59,7 +59,7 @@ def MAC(data_width, matrix_size, data_in, acc_in, switchw, weight_in, weight_we,
     #inlen = max(len(weight), len(data_in))
     #product = weight.sign_extended(inlen*2) * data_in.sign_extended(inlen*2)
     #product = product[:inlen*2]
-    product = helperfuncs.mult_signed(weight, data_in)[:32]
+    product = signed_mult(weight, data_in)[:32]
     #plen = len(weight) + len(data_in)
     #product = weight.sign_extended(plen) * data_in.sign_extended(plen)
     #product = product[:plen]

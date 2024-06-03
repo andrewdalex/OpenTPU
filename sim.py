@@ -20,39 +20,46 @@ class TPUSim(object):
         self.weight_memory = np.load(dram_filename)
         self.host_memory = np.load(hostmem_filename)
         if not args.raw:
-            assert self.weight_memory.dtype == np.int8, 'DRAM weight mem is not 8-bit ints'
-            assert self.host_memory.dtype == np.int8, 'Hostmem not 8-bit ints'
+            pass
+            # assert self.weight_memory.dtype == np.int8, 'DRAM weight mem is not 8-bit ints'
+            # assert self.host_memory.dtype == np.int8, 'Hostmem not 8-bit ints'
         self.unified_buffer = (np.zeros((96000, WIDTH), dtype=np.float32) if args.raw else
-            np.zeros((96000, WIDTH), dtype=np.int8))
+            np.zeros((96000, WIDTH), dtype=np.int32))
         self.accumulator = (np.zeros((4000, WIDTH), dtype=np.float32) if args.raw else
             np.zeros((4000, WIDTH), dtype=np.int32))
         self.weight_fifo = deque()
+        
+        self.pc = 0
 
     def run(self):
         # load program and execute instructions
+        instructions = self.decode()
+        opcodes, operands = instructions[0], instructions[1]
+        
+        # use self.pc to select next instruction, starting from 0, and finishing when halt is reached
         while True:
-            instruction = self.decode()
-            opcode, operands = instruction[0], instruction[1:]
-            if opcode in ['RHM', 'WHM', 'RW']:
-                self.memops(opcode, *operands)
-            elif opcode == 'MMC':
-                self.matrix_multiply_convolve(*operands)
-            elif opcode == 'ACT':
-                self.act(*operands)
-            elif opcode == 'SYNC':
-                pass
-            elif opcode == 'NOP':
-                pass
-            elif opcode == 'HLT':
+            print(f'operands = {operands[self.pc]}')
+            if opcodes[self.pc] in ['RHM', 'WHM', 'RW']:
+                self.memops(opcodes[self.pc], *operands[self.pc])
+            elif opcodes[self.pc] == 'MMC':
+                self.matrix_multiply_convolve(*operands[self.pc])
+            elif opcodes[self.pc] == 'ACT':
+                self.act(*operands[self.pc])
+            elif opcodes[self.pc] == 'SYNC':
+                self.pc += 1
+            elif opcodes[self.pc] == 'NOP':
+                self.pc += 1
+            elif opcodes[self.pc] == 'HLT':
                 print('H A L T')
                 break
             else:
                 raise Exception('WAT (╯°□°）╯︵ ┻━┻')
+            print(f"PC = {self.pc}")
 
         # all done, exit
         savepath = 'sim32.npy' if args.raw else 'sim8.npy'
         np.save(savepath, self.host_memory)
-        print(self.host_memory.astype('uint8'))
+        print(self.host_memory.astype('int8'))
         self.program.close()
 
         print("""ALL DONE!
@@ -60,16 +67,26 @@ class TPUSim(object):
         ( •_•)>⌐■-■
         (⌐■_■)""")
 
+    # decode everything at once and return lists
     def decode(self):
-        opcode = int.from_bytes(self.program.read(isa.OP_SIZE), byteorder='big')
-        opcode = isa.BIN2OPCODE[opcode]
+        opcode_list = []
+        operand_list = []
+        current_opcode = ""
 
-        flag = int.from_bytes(self.program.read(isa.FLAGS_SIZE), byteorder='big')
-        length = int.from_bytes(self.program.read(isa.LEN_SIZE), byteorder='big')
-        src_addr = int.from_bytes(self.program.read(isa.ADDR_SIZE), byteorder='big')
-        dest_addr = int.from_bytes(self.program.read(isa.UB_ADDR_SIZE), byteorder='big')
-        #print('{} decoding: len {}, flags {}, src {}, dst {}'.format(opcode, length, flag, src_addr, dest_addr))
-        return opcode, src_addr, dest_addr, length, flag
+        while True:
+            bytes = self.program.read(isa.OP_SIZE)
+            if not bytes:
+                break
+            current_opcode = int.from_bytes(bytes, byteorder='big')
+            current_opcode = isa.BIN2OPCODE[current_opcode]
+            opcode_list.append(current_opcode)
+            current_flag = int.from_bytes(self.program.read(isa.FLAGS_SIZE), byteorder='big')
+            current_length = int.from_bytes(self.program.read(isa.LEN_SIZE), byteorder='big')
+            current_src_addr = int.from_bytes(self.program.read(isa.ADDR_SIZE), byteorder='big')
+            current_dest_addr = int.from_bytes(self.program.read(isa.UB_ADDR_SIZE), byteorder='big')
+            operand_list.append((current_src_addr, current_dest_addr, current_length, current_flag))
+
+        return opcode_list, operand_list
 
     # opcodes
     def act(self, src, dest, length, flag):
@@ -86,12 +103,47 @@ class TPUSim(object):
             vfunc = np.vectorize(lambda x: x)
             #raise Exception('(╯°□°）╯︵ ┻━┻ bad activation function!')
 
+        print(f'before = {result}')
         result = vfunc(result)
+        print(f'after = {result}')
 
         # downsample/normalize if needed
-        if not args.raw:
-            result = [v & 0x000000FF for v in result]
+        # Don't downsample for gpmatmul
+        # if not args.raw:
+        #     result = [v & 0x000000FF for v in result]
+
+        # branching/comparison logic
+        if result[0][-1] == 1:
+            if result[0][-2] == 1:
+                self.pc += 1 + result[0][0].astype(np.int32)
+            else:
+                self.pc += 1 + result[0][1].astype(np.int32)
+            return # don't to the UB write when there's a branch
+        # equality check
+        elif result[0][-1] == 2:
+            result[0][-1] == 0
+            if result[0][0] == result[0][1]:
+                result[0][0] = 1
+            else:
+                result[0][0] = 0
+            result[0][1] = 0
+            self.pc += 1
+        elif result[0][-1] == 3:
+            # breakpoint()
+            result[0][-1] == 0
+            if result[0][0] < result[0][1]:
+                result[0][0] = 1
+            else:
+                result[0][0] = 0
+            result[0][1] = 0
+            self.pc += 1
+        elif result[0][-1] == 4:
+            self.pc = result[0][1]
+            return
+        else:
+            self.pc += 1
         self.unified_buffer[dest:dest+length] = result
+
 
     def memops(self, opcode, src_addr, dest_addr, length, flag):
         print('Memory xfer! host: {} unified buffer: {}: length: {} (FLAGS? {})'.format(
@@ -100,36 +152,63 @@ class TPUSim(object):
 
         if opcode == 'RHM':
             print('  read host memory to unified buffer')
-            self.unified_buffer[dest_addr:dest_addr + length] = self.host_memory[src_addr:src_addr + length]
+            read_data = np.zeros((1, WIDTH))
+            if flag & isa.SWITCH_MASK:
+                addr = self.unified_buffer[-1][0]
+                vec_addr = addr // 8
+                column = addr % 8
+                read_data[0][0] = self.host_memory[vec_addr][column]
+                self.unified_buffer[dest_addr] = read_data
+            elif flag & isa.CONV_MASK:
+                breakpoint()
+                read_data[0][1] = self.pc + 2
+                read_data[0][-1] = 4
+                self.unified_buffer[dest_addr] = read_data
+            else:
+                self.unified_buffer[dest_addr:dest_addr + length] = self.host_memory[src_addr:src_addr + length]
         elif opcode == 'WHM':
             print('  write unified buffer to host memory')
-            self.host_memory[dest_addr:dest_addr + length] = self.unified_buffer[src_addr:src_addr + length]
+            # asm format dest, src, len
+            if flag & isa.SWITCH_MASK:
+                addr = self.unified_buffer[-1][0]
+                vec_addr = addr // 8
+                column = addr % 8
+                self.host_memory[vec_addr][column] = self.unified_buffer[src_addr][0]
+            else:
+                self.host_memory[dest_addr:dest_addr + length] = self.unified_buffer[src_addr:src_addr + length]
         elif opcode == 'RW':
             print('  read weights from DRAM into MMU')
             self.weight_fifo.append(self.weight_memory[src_addr])
         else:
             raise Exception('WAT (╯°□°）╯︵ ┻━┻')
+        
+        self.pc += 1
 
     def matrix_multiply_convolve(self, ub_addr, accum_addr, size, flags):
-        print('Matrix things....')
-        print('  UB@{} + {} -> MMU -> accumulator@{} + {}'.format(
-            ub_addr, size, accum_addr, size
-        ))
+        # print('Matrix things....')
+        # print('  UB@{} + {} -> MMU -> accumulator@{} + {}'.format(
+        #     ub_addr, size, accum_addr, size
+        # ))
 
         inp = self.unified_buffer[ub_addr: ub_addr + size]
-        print('MMC input shape: {}'.format(inp.shape))
+        # print('MMC input shape: {}'.format(inp.shape))
         weight_mat = self.weight_fifo.popleft()
-        print('MMC weight: {}'.format(weight_mat))
         if not args.raw:
             inp = inp.astype(np.int32)
             weight_mat = weight_mat.astype(np.int32)
+        print('MMC matrix: \n{}'.format(inp))
+        print('MMC weight: \n{}'.format(weight_mat))
         out = np.matmul(inp, weight_mat)
         print('MMC output shape: {}'.format(out.shape))
+        print('MMC output: \n{}'.format(out))
         overwrite = isa.OVERWRITE_MASK & flags
         if overwrite:
             self.accumulator[accum_addr:accum_addr + size] = out
         else:
             self.accumulator[accum_addr:accum_addr + size] += out
+        print(f'Accumulator[{accum_addr}] = {self.accumulator[accum_addr: accum_addr + size]}')
+
+        self.pc += 1
 
 def parse_args():
     global args
@@ -146,6 +225,7 @@ def parse_args():
     args = parser.parse_args()
 
 if __name__ == '__main__':
+    np.set_printoptions(linewidth=150)
     if len(sys.argv) < 4:
         print('Usage:', sys.argv[0], 'PROGRAM_BINARY DRAM_FILE HOST_FILE')
         sys.exit(0)
